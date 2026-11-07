@@ -11,10 +11,11 @@ No cluster/HUD or other models tested. Use at your own risk. See *Safety* below.
 ## Credits
 
 * **Sq00ky / nanaisu** - NBT-AAD itself. Everything here is a patch on top of his source and stays under his licence.
-* **deathwalker80** - found the mechanism (MOST device `0x2471`, `AppState 0xCF1`, `Set 0xCE8`) and wrote the original
+* **RRudkinp** - found the mechanism (MOST device `0x2471`, `AppState 0xCF1`, `Set 0xCE8`) and wrote the original
   patch against the old `src/ccs_input.cpp`, posted in issue #55 (`nbt-aad_main_menu_tile.zip`). This port re-implements
   that behaviour on the refactored MOST client of v1.9.x; the reverse-engineering notes in `src/car/menu_tile.cpp` are
   taken from there.
+* **deathwalker80** - tested the tile on a MINI F60 and pushed for it to become an opt-in (`NBT_TILE`) upstream.
 * **[Bavarian SSH](https://ssh.bavarian-aa.uk/)** - opens SSH on the head unit. You need this before anything here works.
 * Toolchain: [luka-dev/qnx65-armv7-toolchain](https://github.com/luka-dev/qnx65-armv7-toolchain).
 
@@ -58,7 +59,7 @@ plugin** (`[CRASH] fatal signal 11` right after `[BluetoothManager] Initializing
 
 * No BMW files (`text.db`, original images, backups) and no binaries.
 * Cosmetics (own icons, renaming the "n. t. a. (ASIA)" label in `text.db`) modify head unit files and are out of scope here.
-  deathwalker80's `AA-Tile.zip` in issue #55 does the label; the Android Auto logo is Google's, supply your own.
+  RRudkinp's `AA-Tile.zip` in issue #55 does the label; the Android Auto logo is Google's, supply your own.
 
 ## Licence
 
