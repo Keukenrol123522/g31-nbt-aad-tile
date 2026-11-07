@@ -1,0 +1,541 @@
+diff --git a/milestone-7/CMakeLists.txt b/milestone-7/CMakeLists.txt
+index e4a8de0..e0807e2 100644
+--- a/milestone-7/CMakeLists.txt
++++ b/milestone-7/CMakeLists.txt
+@@ -48,6 +48,7 @@ set(SOURCES
+     src/most/client.cpp
+     src/most/trace.cpp
+     src/car/ccs_input.cpp
++    src/car/menu_tile.cpp
+     src/car/volume_input.cpp
+     src/car/input_activity.cpp
+     src/sdr_builder.cpp
+diff --git a/milestone-7/Makefile b/milestone-7/Makefile
+index 556e544..9043995 100644
+--- a/milestone-7/Makefile
++++ b/milestone-7/Makefile
+@@ -48,6 +48,8 @@ SRCS = src/main.cpp \
+        src/most/client.cpp \
+        src/most/trace.cpp \
+        src/car/ccs_input.cpp \
++       src/car/menu_tile.cpp \
++       src/compat_gcc44.cpp \
+        src/car/volume_input.cpp \
+        src/car/input_activity.cpp \
+        src/sdr_builder.cpp \
+diff --git a/milestone-7/src/car/menu_tile.cpp b/milestone-7/src/car/menu_tile.cpp
+new file mode 100644
+index 0000000..0937a8f
+--- /dev/null
++++ b/milestone-7/src/car/menu_tile.cpp
+@@ -0,0 +1,195 @@
++// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
++// Required Notice: Copyright (c) 2026 nanaisu - NBT-AAD (https://github.com/Sq00ky/Supra-iDrive6-Android-Auto)
++#include "car/menu_tile.hpp"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <vector>
++#include "most/ids.hpp"
++#include "most/msg.hpp"
++
++// RE notes (HmiMain3D May 2020 build, from issue #55): the CarLife main-menu tile is shown by the CarLife proxy's
++// AppState attribute (FktID 0xCF1, u8, 0 = available). The HMI subscribes to the properties of FBlock 0x24 inst 0x71 as
++// soon as a device with that key appears on MOST (Set Notification: fkt 0x001, data 01 <ctrl BE> <fkt BE>); the device
++// answers with a Status (opType 0xC) for each supported property and with the standard error (opType 0xF, fkt 0x001,
++// data 20 10 <fkt BE>) for the rest. Selecting the tile makes the HMI send Set 0xCE8 (1 byte: 0 tile, 1 Media entry).
++
++namespace nbt {
++namespace car {
++
++namespace {
++
++const uint16_t kTileKey = 0x2471;       // FBlock 0x24, instance 0x71
++const uint16_t kFktAppState = 0x0CF1;
++const uint16_t kFktFocusReq = 0x0CE8;
++const uint16_t kFktNotification = 0x001;
++
++} // namespace
++
++MenuTile::MenuTile()
++    : on_(false), always_(false), cb_(NULL), user_(NULL), want_(0), stop_(false), done_(false), registered_(false),
++      sent_(-1), dev_(0), ctrl_(0) {
++    pthread_mutex_init(&lock_, NULL);
++}
++
++bool MenuTile::attach(most::Client& client, TilePressCb cb, void* user) {
++    const char* e = getenv("NBT_TILE");
++    if (!(e && e[0] == '1')) {
++        printf("[Tile] main-menu tile off (NBT_TILE=1 turns it on)\n");
++        return false;
++    }
++    const char* a = getenv("NBT_TILE_ALWAYS");
++    always_ = a && a[0] == '1';
++    cb_ = cb;
++    user_ = user;
++    if (always_) want_ = 1;
++    most::DeviceHook h;
++    h.onRegistered = &MenuTile::registeredTramp;
++    h.onMessage = &MenuTile::messageTramp;
++    h.onTick = &MenuTile::tickTramp;
++    h.user = this;
++    if (!client.setDeviceHook(h) || !client.addLinkListener(&MenuTile::linkTramp, this)) {
++        printf("[Tile] no room on the MOST client: main-menu tile disabled\n");
++        return false;
++    }
++    on_ = true;
++    printf("[Tile] main-menu tile on: MOST device 0x%04X, tile %s\n", kTileKey,
++           always_ ? "always visible (NBT_TILE_ALWAYS=1)" : "follows the phone session");
++    return true;
++}
++
++void MenuTile::setVisible(bool visible) {
++    if (!on_) return;
++    pthread_mutex_lock(&lock_);
++    want_ = (always_ || visible) ? 1 : 0;
++    pthread_mutex_unlock(&lock_);
++}
++
++void MenuTile::shutdown() {
++    if (!on_) return;
++    pthread_mutex_lock(&lock_);
++    bool reg = registered_;
++    stop_ = true;
++    pthread_mutex_unlock(&lock_);
++    if (!reg) return;
++    for (int w = 0; w < 30; ++w) {
++        pthread_mutex_lock(&lock_);
++        bool d = done_;
++        pthread_mutex_unlock(&lock_);
++        if (d) break;
++        usleep(50000);     // the DSI thread unregisters on its next callback
++    }
++    usleep(300000);        // let the requests leave
++}
++
++void MenuTile::registeredTramp(DsiClient* c, uint32_t client, uint16_t dev, void* self) {
++    static_cast<MenuTile*>(self)->onRegistered(c, client, dev);
++}
++bool MenuTile::messageTramp(DsiClient* c, const most::View& m, uint32_t client, void* self) {
++    return static_cast<MenuTile*>(self)->onMessage(c, m, client);
++}
++void MenuTile::tickTramp(DsiClient* c, uint32_t client, void* self) { static_cast<MenuTile*>(self)->onTick(c, client); }
++void MenuTile::linkTramp(most::LinkState s, void* self) { static_cast<MenuTile*>(self)->onLink(s); }
++
++void MenuTile::onLink(most::LinkState s) {
++    // Only a lost connection ends the registration: after a re-attach the client registers again and onRegistered runs.
++    if (s != most::kDetached) return;
++    pthread_mutex_lock(&lock_);
++    registered_ = false;
++    pthread_mutex_unlock(&lock_);
++}
++
++void MenuTile::onRegistered(DsiClient* c, uint32_t client, uint16_t dev) {
++    dev_ = dev;
++    ctrl_ = 0;
++    sent_ = -1;
++    pthread_mutex_lock(&lock_);
++    registered_ = true;
++    pthread_mutex_unlock(&lock_);
++    std::vector<uint16_t> keys(1, kTileKey);
++    c->sendRequest(most::kReqRegisterDevices, most::buildRegisterDevCtrls(client, keys));   // we are FBlock 0x24 inst 0x71
++    printf("[Tile] registered MOST device 0x%04X (client %u, device id 0x%04X)\n", kTileKey, client, (unsigned)dev);
++}
++
++void MenuTile::send(DsiClient* c, uint32_t client, uint16_t fkt, uint8_t op, const uint8_t* d, size_t n) {
++    most::Msg m;
++    m.txType = 0; m.varTag = 1; m.varVal = 0;                  // device -> controller
++    m.dst = ctrl_; m.src = dev_;
++    m.fblock = (uint8_t)(kTileKey >> 8); m.inst = (uint8_t)(kTileKey & 0xff);
++    m.fkt = fkt; m.opType = op; m.hdrTag = (uint32_t)(dev_ & 0xff);
++    m.data.assign(d, d + n);
++    std::vector<uint8_t> mm = most::buildMessage(m);
++    std::vector<uint8_t> p;
++    most::putLe32(p, client);
++    p.insert(p.end(), mm.begin(), mm.end());
++    c->sendRequest(most::kReqProcessMessage, p);               // DSYSMOSTServer ProcessMessage
++}
++
++void MenuTile::publish(DsiClient* c, uint32_t client) {
++    if (!ctrl_) return;                                        // the HMI has not asked yet
++    pthread_mutex_lock(&lock_);
++    int want = want_;
++    pthread_mutex_unlock(&lock_);
++    if (want == sent_) return;
++    uint8_t v = want ? 0 : 1;                                  // AppState: 0 available (tile shown), 1 not available
++    send(c, client, kFktAppState, most::kOpStatus, &v, 1);
++    sent_ = want;
++    printf("[Tile] main-menu tile %s\n", want ? "shown" : "hidden");
++}
++
++// Top of every DSI callback of the MOST client (sends are only valid on that connection thread).
++void MenuTile::onTick(DsiClient* c, uint32_t client) {
++    pthread_mutex_lock(&lock_);
++    bool reg = registered_, stop = stop_, done = done_;
++    pthread_mutex_unlock(&lock_);
++    if (!reg || done) return;
++    if (stop) {
++        pthread_mutex_lock(&lock_);
++        done_ = true;
++        want_ = 0;
++        pthread_mutex_unlock(&lock_);
++        publish(c, client);                                    // hide the tile first
++        std::vector<uint16_t> keys(1, kTileKey);
++        c->sendRequest(most::kReqUnregisterDevices, most::buildRegisterDevCtrls(client, keys));
++        std::vector<uint8_t> u;
++        most::putLe32(u, client);
++        c->sendRequest(most::kReqUnregisterClient, u);
++        printf("[Tile] device 0x%04X unregistered\n", kTileKey);
++        return;
++    }
++    publish(c, client);
++}
++
++// A MOST message for our device. True when it was consumed (it is then not routed to the other consumers).
++bool MenuTile::onMessage(DsiClient* c, const most::View& m, uint32_t client) {
++    pthread_mutex_lock(&lock_);
++    bool reg = registered_;
++    pthread_mutex_unlock(&lock_);
++    if (!reg || m.fblock != (uint8_t)(kTileKey >> 8) || m.inst != (uint8_t)(kTileKey & 0xff) || m.dst != dev_) return false;
++    if (m.op == most::kOpSet && m.fkt == kFktNotification && m.len == 5 && m.data[0] == 0x01) {
++        ctrl_ = (uint16_t)((m.data[1] << 8) | m.data[2]);
++        uint16_t fid = (uint16_t)((m.data[3] << 8) | m.data[4]);
++        if (fid == kFktAppState) {
++            pthread_mutex_lock(&lock_);
++            int want = want_;
++            pthread_mutex_unlock(&lock_);
++            uint8_t v = want ? 0 : 1;
++            send(c, client, fid, most::kOpStatus, &v, 1);
++            sent_ = want;
++        } else {
++            uint8_t e[4] = { 0x20, 0x10, m.data[3], m.data[4] };
++            send(c, client, kFktNotification, most::kOpError, e, 4);
++        }
++        return true;
++    }
++    if (m.op == most::kOpSet && m.fkt == kFktFocusReq && m.len == 1) {
++        printf("[Tile] the driver selected the %s\n", m.data[0] ? "Media entry" : "main-menu tile");
++        if (cb_) cb_(user_);
++        return true;
++    }
++    return true;                                               // anything else sent to 0x2471 is ignored
++}
++
++} // namespace car
++} // namespace nbt
+diff --git a/milestone-7/src/car/menu_tile.hpp b/milestone-7/src/car/menu_tile.hpp
+new file mode 100644
+index 0000000..b40ddec
+--- /dev/null
++++ b/milestone-7/src/car/menu_tile.hpp
+@@ -0,0 +1,68 @@
++// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
++// Required Notice: Copyright (c) 2026 nanaisu - NBT-AAD (https://github.com/Sq00ky/Supra-iDrive6-Android-Auto)
++#ifndef CAR_MENU_TILE_HPP
++#define CAR_MENU_TILE_HPP
++
++#include <pthread.h>
++#include <stddef.h>
++#include <stdint.h>
++#include "most/client.hpp"
++
++namespace nbt {
++namespace car {
++
++typedef void (*TilePressCb)(void* user);
++
++// Main-menu shortcut tile (OPT-IN: NBT_TILE=1; NBT_TILE_ALWAYS=1 keeps it visible without a phone, for testing).
++// Ported onto the MOST client library from the unmerged patch by deathwalker80 (issue #55, written against the old
++// src/ccs_input.cpp). The HMI's native CarLife tile is driven from here: the daemon registers a MOST device FBlock 0x24
++// inst 0x71 (the slot the HMI's CarLife proxy expects), answers the HMI's notification requests, shows the tile with
++// AppState 0 and hides it with 1. Only AppState is ever sent: other CarLife statuses hide the tile again.
++// This is the one place where the daemon SENDS on MOST (registerDevices, processMessage, unregister), and only for
++// that one device. Everything runs on the DSI callback thread; the main loop only sets a flag.
++class MenuTile {
++public:
++    MenuTile();
++
++    // Before the client's start(). False: off (the default) or no room on the client.
++    bool attach(most::Client& client, TilePressCb cb, void* user);
++
++    // From the main loop: true while a phone session is active.
++    void setVisible(bool visible);
++
++    // Hides the tile and unregisters the device and the MOST client; waits up to ~1.5 s for the DSI thread.
++    void shutdown();
++
++private:
++    static void registeredTramp(DsiClient* c, uint32_t client, uint16_t dev, void* self);
++    static bool messageTramp(DsiClient* c, const most::View& m, uint32_t client, void* self);
++    static void tickTramp(DsiClient* c, uint32_t client, void* self);
++    static void linkTramp(most::LinkState s, void* self);
++    void onRegistered(DsiClient* c, uint32_t client, uint16_t dev);
++    bool onMessage(DsiClient* c, const most::View& m, uint32_t client);
++    void onTick(DsiClient* c, uint32_t client);
++    void onLink(most::LinkState s);
++    void send(DsiClient* c, uint32_t client, uint16_t fkt, uint8_t op, const uint8_t* d, size_t n);
++    void publish(DsiClient* c, uint32_t client);
++
++    bool on_;
++    bool always_;
++    TilePressCb cb_;
++    void* user_;
++
++    pthread_mutex_t lock_;   // want_, stop_, done_, registered_: main thread and DSI thread
++    int want_;
++    bool stop_;
++    bool done_;
++    bool registered_;
++
++    // DSI callback thread only.
++    int sent_;               // last AppState published as want (-1: none)
++    uint16_t dev_;           // our MOST device id (from the client response)
++    uint16_t ctrl_;          // the HMI's MOST address, learned from its first request
++};
++
++} // namespace car
++} // namespace nbt
++
++#endif
+diff --git a/milestone-7/src/compat_gcc44.cpp b/milestone-7/src/compat_gcc44.cpp
+new file mode 100644
+index 0000000..36813fb
+--- /dev/null
++++ b/milestone-7/src/compat_gcc44.cpp
+@@ -0,0 +1,28 @@
++// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
++// Required Notice: Copyright (c) 2026 nanaisu - NBT-AAD (https://github.com/Sq00ky/Supra-iDrive6-Android-Auto)
++//
++// Compatibility for linking against the head unit's own libstdc++.so.6 (QNX 6.5 SDP, GCC 4.4.2, libstdc++ 6.0.13)
++// while compiling with the GCC 4.9.4 toolchain. Two runtime helpers that GCC 4.9 headers/codegen call did not exist
++// yet in 6.0.13; without these definitions they stay undefined and the QNX loader only reports "unknown symbol" and
++// crashes if they are ever reached. Both are only used on error paths (vector::at out of range, new[] length overflow).
++// Why dynamic at all: the iDrive app starts the daemon with LD_PRELOAD=libEGL_X.gpp.so:... which loads the HU's GNU
++// libstdc++.so.6 into the process; a second, static libstdc++ in the executable crashed at the first DSI call (SIGSEGV).
++#include <cstdarg>
++#include <cstdio>
++#include <new>
++#include <stdexcept>
++
++namespace std {
++void __throw_out_of_range_fmt(const char* fmt, ...) {
++    char buf[256];
++    va_list ap;
++    va_start(ap, fmt);
++    vsnprintf(buf, sizeof(buf), fmt, ap);
++    va_end(ap);
++    throw std::out_of_range(buf);
++}
++} // namespace std
++
++extern "C" void __cxa_throw_bad_array_new_length() {
++    throw std::bad_alloc();   // std::bad_array_new_length has no typeinfo in 6.0.13
++}
+diff --git a/milestone-7/src/main.cpp b/milestone-7/src/main.cpp
+index 492b3d5..2ebaca5 100644
+--- a/milestone-7/src/main.cpp
++++ b/milestone-7/src/main.cpp
+@@ -104,6 +104,7 @@
+ #include "aa_keys.hpp"
+ #include "car/ccs_config.hpp"
+ #include "car/ccs_input.hpp"
++#include "car/menu_tile.hpp"
+ #include "car/volume_input.hpp"
+ #include "car/input_activity.hpp"
+ #include "most/client.hpp"
+@@ -150,6 +151,7 @@ static uint32_t upMs() { return (uint32_t)(upSec() * 1000.0); }
+ static nbt::AASession g_session;
+ static nbt::kombinav::KombiNav g_kombiNav;   // Android Auto turn arrows on the J29 cluster / HUD (opt-in)
+ static nbt::most::Client g_most;             // the one MOST observe client, started once its consumers have attached
++static nbt::car::MenuTile g_tile;           // opt-in main-menu tile (NBT_TILE=1): a virtual MOST device on g_most
+ static nbt::car::CcsInput g_ccs;             // iDrive controller and voice button: a consumer of g_most
+ static nbt::car::VolumeInput g_carVolume;    // the car's master volume for the overlay: a consumer of g_most
+ static nbt::car::InputActivity g_carInput;   // any car control the driver touched: a consumer of g_most
+@@ -373,6 +375,9 @@ static uint16_t ctlPort() {
+     return (uint16_t)((v > 0 && v < 65536) ? v : 52790);
+ }
+ 
++// The main-menu tile (car/menu_tile.cpp) was selected: same as the iDrive Android Auto entry ("show").
++static void onTilePress(void*) { g_showReq = 1; g_mainWake = 1; }
++
+ static void* ctlThread(void*) {
+     char buf[32];
+     while (g_running) {
+@@ -1496,7 +1501,7 @@ static void onKnobEvent(const nbt::car::CcsEvent& ev, void* user) {
+     }
+ }
+ 
+-#define NBT_AAD_BUILD "v1.9.19-safety"
++#define NBT_AAD_BUILD "v1.9.19-tile2"
+ 
+ // ---- log destination ------------------------------------------------------------------------------------------
+ // Default: no USB file; stdout (which the iDrive app sends to /dev/null) goes to the RAM log /dev/shmem/nbt-aad.log
+@@ -1798,6 +1803,7 @@ int main(int argc, char* argv[]) {
+         printf("[Main] NBT_CCS_DEBUG / NBT_CCS_ALL are replaced by NBT_MOST_LOG=1: turning that on.\n");
+     if ((nbt::envFlag("NBT_MOST_LOG") == 1 || ccsLogCompat) && !g_mostTrace.attach(g_most))
+         printf("[Main] NBT_MOST_LOG: could not attach to the MOST client.\n");
++    g_tile.attach(g_most, &onTilePress, NULL);   // before start(): off unless NBT_TILE=1; logs why
+     g_most.setRawLog(getenv("NBT_KNOB_RAW") != NULL);
+     if (!g_most.start("NBTAAD_MOST"))
+         printf("[Main] MOST client failed to start: knob/keys disabled.\n");
+@@ -1879,6 +1885,7 @@ int main(int argc, char* argv[]) {
+             g_most.logHealth();
+         }
+         bool act = g_session.isActive();
++        g_tile.setVisible(act);                          // main-menu tile follows the phone session (like CarPlay's)
+         if (act || g_sessionActive) cp_idle_ticks = 0;
+         else if (++cp_idle_ticks == 10 && nbt::VideoManager::cpHandoff()) video.retuneForCarPlay();
+         {
+@@ -2127,6 +2134,8 @@ int main(int argc, char* argv[]) {
+     video.setVisible(false);   // give iDrive back first: any of the stop() calls below may block
+     g_volumeOsd.setShown(false);
+     printf("[Main] [+%.2f s] overlay hidden\n", upSec() - t0);
++    g_tile.shutdown();         // hide the main-menu tile and unregister its MOST device before the process ends
++    printf("[Main] [+%.2f s] tile removed\n", upSec() - t0);
+     if (mic_live) g_audioBackend->stopMic(mic);
+     voice.deactivate("shutdown");   // never leave the car mic scenario active behind us
+     g_kombiNav.stop();              // clears a cluster/HUD arrow (one quick attempt)
+diff --git a/milestone-7/src/most/client.cpp b/milestone-7/src/most/client.cpp
+index 79e38ae..4b169eb 100644
+--- a/milestone-7/src/most/client.cpp
++++ b/milestone-7/src/most/client.cpp
+@@ -45,6 +45,7 @@ Client::Client()
+       attached_(false), answered_(false), clientId_(kClientRefused), deviceId_(0), haveComm_(false), comm_(0),
+       commOkSeen_(false), longestWindowMs_(0), lastHealthMs_(0) {
+     name_[0] = 0;
++    memset(&hook_, 0, sizeof(hook_));
+     memset(firstSeen_, 0, sizeof(firstSeen_));
+     memset(&total_, 0, sizeof(total_));
+     memset(&lastHealth_, 0, sizeof(lastHealth_));
+@@ -87,11 +88,17 @@ bool Client::setInfoTap(InfoTapCb cb, void* user) {
+     return true;
+ }
+ 
++bool Client::setDeviceHook(const DeviceHook& h) {
++    if (started_ || !h.onMessage || hook_.onMessage) return false;
++    hook_ = h;
++    return true;
++}
++
+ void Client::setRawLog(bool on) { rawLog_ = on; }
+ 
+ bool Client::start(const char* clientName) {
+     if (started_) return false;
+-    if (router_.size() == 0 && !tap_) {
++    if (router_.size() == 0 && !tap_ && !hook_.onMessage) {
+         printf("[MOST] no consumer attached: client not started\n");
+         return true;
+     }
+@@ -175,8 +182,9 @@ void Client::onDetached() {
+ }
+ 
+ void Client::onData(DsiClient* c, uint32_t id, const uint8_t* p, uint32_t len) {
++    if (hook_.onTick && clientId_ != kClientRefused) hook_.onTick(c, clientId_, hook_.user);
+     if (id == kInfoMessage) {
+-        onMessage(p, len);
++        onMessage(c, p, len);
+         return;
+     }
+     if (infoTap_) infoTap_(id, p, len, infoTapUser_);
+@@ -193,10 +201,12 @@ void Client::onData(DsiClient* c, uint32_t id, const uint8_t* p, uint32_t len) {
+         if (refused || stage_ >= 2) return;
+         c->setNotification(kAttrCommState);
+         stage_ = 2;
+-        if (nKeys_ == 0) return;     // the vendor client skips it too, and the server logs an error for an empty list
+-        std::vector<uint16_t> keys(keys_, keys_ + nKeys_);
+-        c->sendRequest(kReqRegisterDevCtrls, buildRegisterDevCtrls(client, keys));
+-        printf("[MOST] registerDevCtrls sent (%d keys)\n", nKeys_);
++        if (nKeys_ > 0) {            // the vendor client skips it too, and the server logs an error for an empty list
++            std::vector<uint16_t> keys(keys_, keys_ + nKeys_);
++            c->sendRequest(kReqRegisterDevCtrls, buildRegisterDevCtrls(client, keys));
++            printf("[MOST] registerDevCtrls sent (%d keys)\n", nKeys_);
++        }
++        if (hook_.onRegistered) hook_.onRegistered(c, client, (uint16_t)dev, hook_.user);
+         return;
+     }
+     if (id == kAttrCommState && len >= 4) {
+@@ -228,7 +238,7 @@ void Client::noteFirst(const View& m, MsgClass c, bool wanted) {
+     }
+ }
+ 
+-void Client::onMessage(const uint8_t* p, uint32_t len) {
++void Client::onMessage(DsiClient* dsi, const uint8_t* p, uint32_t len) {
+     View m;
+     if (!parseView(p, len, m)) {
+         pthread_mutex_lock(&lock_);
+@@ -242,9 +252,12 @@ void Client::onMessage(const uint8_t* p, uint32_t len) {
+     noteFirst(m, c, wanted);
+     if (tap_) tap_(m, c, tapUser_);
+ 
++    bool consumed = hook_.onMessage && hook_.onMessage(dsi, m, clientId_, hook_.user);
+     int ran = 0;
+     bool joined = false, lost = false;
+-    if (c == kSegFirst || c == kSegMiddle || c == kSegLast) {
++    if (consumed) {
++        // for the virtual device: not routed
++    } else if (c == kSegFirst || c == kSegMiddle || c == kSegLast) {
+         if (wanted) {
+             View whole;
+             Reassembler::Result r = reassembler_.feed(m, c, whole);
+diff --git a/milestone-7/src/most/client.hpp b/milestone-7/src/most/client.hpp
+index 64ae84a..b619299 100644
+--- a/milestone-7/src/most/client.hpp
++++ b/milestone-7/src/most/client.hpp
+@@ -61,6 +61,16 @@ struct ClientStats {
+     uint32_t longestHandlerMs;
+ };
+ 
++// Opt-in virtual device (the main-menu tile). All three run on the DSI callback thread with the connection, the only place
++// a send is valid, and under the handler rules above. onMessage returns true when the message was for the device: it is
++// then not routed to the other consumers. Without a hook the client stays observe-only.
++struct DeviceHook {
++    void (*onRegistered)(DsiClient* c, uint32_t client, uint16_t dev, void* user);   // registration answered, not refused
++    bool (*onMessage)(DsiClient* c, const View& m, uint32_t client, void* user);
++    void (*onTick)(DsiClient* c, uint32_t client, void* user);                       // top of every DSI callback
++    void* user;
++};
++
+ class Client {
+ public:
+     enum { kMaxKeys = 16, kMaxLinkListeners = 4 };
+@@ -73,6 +83,7 @@ public:
+     bool addLinkListener(LinkCb cb, void* user);
+     bool setTap(TapCb cb, void* user);        // one of each tap; the message tap counts as a consumer for start()
+     bool setInfoTap(InfoTapCb cb, void* user);
++    bool setDeviceHook(const DeviceHook& h);   // one; counts as a consumer for start()
+     void setRawLog(bool on);                  // log every raw DSI event (very noisy)
+ 
+     // Opens the DSI connection. With no consumer attached it does nothing and returns true. False: DSI open failed.
+@@ -91,7 +102,7 @@ private:
+     void onAttached(DsiClient* c);
+     void onDetached();
+     void onData(DsiClient* c, uint32_t id, const uint8_t* p, uint32_t len);
+-    void onMessage(const uint8_t* p, uint32_t len);
++    void onMessage(DsiClient* dsi, const uint8_t* p, uint32_t len);
+     void noteFirst(const View& m, MsgClass c, bool wanted);
+     LinkState deriveStateLocked() const;
+     void updateStateLocked();         // call with lock_ held: unlocks it, then tells the listeners about a change
+@@ -107,6 +118,7 @@ private:
+     void* tapUser_;
+     InfoTapCb infoTap_;
+     void* infoTapUser_;
++    DeviceHook hook_;
+     bool started_;
+     bool rawLog_;
+     char name_[32];
+diff --git a/milestone-7/src/most/ids.hpp b/milestone-7/src/most/ids.hpp
+index a3914bc..cf01c93 100644
+--- a/milestone-7/src/most/ids.hpp
++++ b/milestone-7/src/most/ids.hpp
+@@ -26,6 +26,10 @@ enum { kInterfaceMajor = 4, kInterfaceMinor = 5 };
+ const uint32_t kReqRegisterDevCtrls = 0x1;   // u32 client, u32 count, u16 keys[count]; skipped when the list is empty
+ const uint32_t kReqProcessMessage   = 0x2;   // u32 client, MessageType
+ const uint32_t kReqRegisterClient   = 0xF;   // registerMOSTClientExt(string): the name is a trace label
++// Only for the opt-in main-menu tile (car/menu_tile.cpp, NBT_TILE=1), the one virtual device this daemon registers:
++const uint32_t kReqRegisterDevices   = 0x0;  // same payload as registerDevCtrls: u32 client, u32 count, u16 keys[count]
++const uint32_t kReqUnregisterDevices = 0x4;  // same payload
++const uint32_t kReqUnregisterClient  = 0x10; // unregisterMOSTClientExt: u32 client
+ 
+ // Information.
+ const uint32_t kInfoClientResponse  = 0x80000000u;   // u32 clientId, u16 deviceId
